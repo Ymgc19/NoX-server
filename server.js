@@ -227,9 +227,16 @@ wss.on("connection", (ws) => {
     if (ws.roomCode) {
       const room = rooms.get(ws.roomCode);
       if (room) {
+        // 対戦中の切断 (アプリを閉じた等) は切断側の強制敗北。
+        // ランクマッチなら勝ち点も確定させてから残ったピアに通知する。
+        if (room.rank && room.startedAt && !room.rank.resultDone) {
+          const winnerIdx = (room.host === ws) ? 1 : 0; // 切断していない側が勝者
+          console.log(`[rank] disconnect forfeit: P${winnerIdx === 0 ? 2 : 1} left → P${winnerIdx + 1} wins`);
+          resolveRankResult(room, winnerIdx);
+        }
         if (room.host === ws) room.host = null;
         if (room.guest === ws) room.guest = null;
-        // PoC: ピアが落ちたらルーム破棄
+        // PoC: ピアが落ちたらルーム破棄 (残ったピアには peer_left が届き、クライアント側で勝利処理)
         cleanupRoom(ws.roomCode);
       }
     }
