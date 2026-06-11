@@ -12,12 +12,150 @@
 //      PORT (default 4567)
 // =========================================================
 const { WebSocketServer } = require("ws");
+const fs = require("fs");
+const path = require("path");
 
 const PORT = parseInt(process.env.PORT || "4567", 10);
 const ROOM_CODE_LEN = 6;
 const HEARTBEAT_MS = 25_000;
 
-const rooms = new Map(); // code -> { host, guest, decks:{0,1}, names:{0,1}, startedAt }
+const rooms = new Map(); // code -> { host, guest, decks:{0,1}, names:{0,1}, startedAt, rank }
+
+// ==================== ランクマッチ: 勝ち点・戦績の永続化 ====================
+// users: { userId: { name, points, wins, losses } }
+// 初期勝ち点 10。勝ち +2 / 負け -2。
+// 例外: 敗者の勝率が 70% を超えていた試合は勝者 +5 / 敗者 -5。
+const RANK_FILE = path.join(__dirname, "rank_stats.json");
+const RANK_START_POINTS = 10;
+let rankDb = { users: {} };
+try {
+  if (fs.existsSync(RANK_FILE)) rankDb = JSON.parse(fs.readFileSync(RANK_FILE, "utf8"));
+  if (!rankDb.users) rankDb.users = {};
+} catch (e) { console.error("rank_stats.json load error:", e); rankDb = { users: {} }; }
+
+function saveRankDb() {
+  try { fs.writeFileSync(RANK_FILE, JSON.stringify(rankDb, null, 2)); }
+  catch (e) { console.error("rank_stats.json save error:", e); }
+}
+function getRankUser(userId, name) {
+  if (!userId) return null;
+  if (!rankDb.users[userId]) {
+    rankDb.users[userId] = { name: name || "", points: RANK_START_POINTS, wins: 0, losses: 0 };
+  }
+  if (name) rankDb.users[userId].name = name;
+  return rankDb.users[userId];
+}
+function winRateOf(u) {
+  const games = (u.wins || 0) + (u.losses || 0);
+  return games > 0 ? u.wins / games : 0;
+}
+function publicStats(u) {
+  return { points: u.points, wins: u.wins, losses: u.losses, winRate: winRateOf(u) };
+}
+
+// マッチングキュー: { ws, userId, name, deck }
+const rankQueue = [];
+function removeFromQueue(ws) {
+  const i = rankQueue.findIndex(q => q.ws === ws);
+  if (i >= 0) rankQueue.splice(i, 1);
+}
+function tryRankMatch() {
+  while (rankQueue.length >= 2) {
+    const a = rankQueue.shift();
+    const bIdx = rankQueue.findIndex(q => q.ws !== a.ws && q.userId !== a.userId);
+    if (bIdx < 0) { rankQueue.unshift(a); return; } // 相手候補なし (同一ユーザーのみ)
+    const b = rankQueue.splice(bIdx, 1)[0];
+    if (!a.ws || a.ws.readyState !== a.ws.OPEN) { rankQueue.unshift(b); continue; }
+    if (!b.ws || b.ws.readyState !== b.ws.OPEN) { rankQueue.unshift(a); continue; }
+
+    // 内部ルームを作って即マッチ開始 (デッキはキュー参加時に提出済み)
+    const code = randomRoomCode();
+    const uA = getRankUser(a.userId, a.name);
+    const uB = getRankUser(b.userId, b.name);
+    const room = {
+      host: a.ws, guest: b.ws,
+      decks: { 0: a.deck, 1: b.deck },
+      names: { 0: a.name || "プレイヤー1", 1: b.name || "プレイヤー2" },
+      startedAt: Date.now(),
+      rank: {
+        userIds: [a.userId, b.userId],
+        statsAtStart: [publicStats(uA), publicStats(uB)],
+        resultDone: false,
+      },
+    };
+    rooms.set(code, room);
+    a.ws.roomCode = code; a.ws.role = "host";
+    b.ws.roomCode = code; b.ws.role = "guest";
+
+    const firstPlayer = Math.random() < 0.5 ? 0 : 1;
+    const shuffled = [shuffle(room.decks[0]), shuffle(room.decks[1])];
+    const base = {
+      deckP1: shuffled[0], deckP2: shuffled[1],
+      firstPlayer, startedAt: room.startedAt,
+      nameP1: room.names[0], nameP2: room.names[1],
+      rank: true,
+    };
+    send(a.ws, "match_start", { ...base, yourPlayer: 0, you: publicStats(uA), opp: publicStats(uB) });
+    send(b.ws, "match_start", { ...base, yourPlayer: 1, you: publicStats(uB), opp: publicStats(uA) });
+    console.log(`[rank] ${code} match: ${room.names[0]}(${(winRateOf(uA) * 100).toFixed(0)}%) vs ${room.names[1]}(${(winRateOf(uB) * 100).toFixed(0)}%)`);
+  }
+}
+
+// 勝敗確定 → 勝ち点を計算して両者へ通知
+function resolveRankResult(room, winnerIdx) {
+  if (!room.rank || room.rank.resultDone) return;
+  room.rank.resultDone = true;
+  const [uidA, uidB] = room.rank.userIds;
+  const uA = getRankUser(uidA), uB = getRankUser(uidB);
+  let deltas = [0, 0];
+  if (winnerIdx === 0 || winnerIdx === 1) {
+    const winner = winnerIdx === 0 ? uA : uB;
+    const loser  = winnerIdx === 0 ? uB : uA;
+    // 勝率は試合開始時点の値で判定 (敗者の勝率が70%超なら ±5、それ以外 ±2)
+    const loserWrAtStart = room.rank.statsAtStart[winnerIdx === 0 ? 1 : 0].winRate;
+    const amount = loserWrAtStart > 0.7 ? 5 : 2;
+    winner.wins += 1;
+    loser.losses += 1;
+    winner.points = winner.points + amount;
+    loser.points = Math.max(0, loser.points - amount);
+    deltas = winnerIdx === 0 ? [amount, -amount] : [-amount, amount];
+  }
+  saveRankDb();
+  const payload = (idx, u) => ({
+    delta: deltas[idx],
+    points: u.points, wins: u.wins, losses: u.losses, winRate: winRateOf(u),
+    winnerIdx,
+    oppWinRateAtStart: room.rank.statsAtStart[1 - idx].winRate,
+  });
+  send(room.host,  "rank_update", payload(0, uA));
+  send(room.guest, "rank_update", payload(1, uB));
+  console.log(`[rank] result winner=P${winnerIdx + 1} deltas=${deltas.join("/")}`);
+}
+
+// 全ユーザー分布 (ホームの STATS ブロック用) — 勝ち点ベースのヒストグラム
+function buildRankStats(userId) {
+  const all = Object.values(rankDb.users)
+    .map(u => ({ games: u.wins + u.losses, points: u.points, winRate: winRateOf(u) }))
+    .filter(u => u.games >= 1);
+  // 勝ち点の分布: 0 〜 max を 10 ビンに分割 (binSize はキリの良い値に切り上げ)
+  const maxP = Math.max(20, ...all.map(u => u.points));
+  const binSize = Math.max(2, Math.ceil((maxP + 1) / 10 / 2) * 2);
+  const bins = new Array(10).fill(0);
+  for (const u of all) bins[Math.min(9, Math.floor(u.points / binSize))]++;
+  const me = rankDb.users[userId];
+  let topPercent = null;
+  if (me && all.length > 0) {
+    const above = all.filter(u => u.points > me.points).length;
+    topPercent = Math.max(1, Math.round(((above + 1) / all.length) * 100));
+  }
+  return {
+    histType: "points",
+    histogram: bins,
+    binSize,
+    totalUsers: all.length,
+    you: me ? { ...publicStats(me), topPercent } : null,
+  };
+}
 
 function randomRoomCode() {
   // 紛らわしい 0/O/1/I/L を除いた 30 文字から 6 桁
@@ -85,6 +223,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     console.log(`[conn] client disconnected`);
+    removeFromQueue(ws); // ランクマッチキューから除外
     if (ws.roomCode) {
       const room = rooms.get(ws.roomCode);
       if (room) {
@@ -189,6 +328,47 @@ function handleMessage(ws, msg) {
       const room = rooms.get(ws.roomCode);
       if (!room) return;
       broadcastToRoom(room, "chat", { from: ws.role, text: String(msg.text || "").slice(0, 200) }, ws);
+      return;
+    }
+
+    // ===== ランクマッチ =====
+    case "rank_queue": {
+      if (ws.roomCode) { send(ws, "error", { message: "既にルームに参加しています" }); return; }
+      const userId = String(msg.userId || "").slice(0, 64);
+      const deck = Array.isArray(msg.deck) ? msg.deck.slice(0, 30) : null;
+      if (!userId) { send(ws, "error", { message: "userIdがありません" }); return; }
+      if (!deck || deck.length === 0) { send(ws, "error", { message: "デッキが空です" }); return; }
+      removeFromQueue(ws); // 二重キュー防止
+      const name = String(msg.username || "").trim().slice(0, 16);
+      getRankUser(userId, name);
+      saveRankDb();
+      rankQueue.push({ ws, userId, name, deck });
+      send(ws, "rank_queued", { queueSize: rankQueue.length });
+      console.log(`[rank] queued: ${name || userId} (queue=${rankQueue.length})`);
+      tryRankMatch();
+      return;
+    }
+
+    case "rank_cancel": {
+      removeFromQueue(ws);
+      send(ws, "rank_cancelled", {});
+      return;
+    }
+
+    case "rank_result": {
+      // 勝敗報告 (両クライアントから届くが最初の1件のみ処理)
+      if (!ws.roomCode) return;
+      const room = rooms.get(ws.roomCode);
+      if (!room || !room.rank) return;
+      const w = msg.winner; // 0 | 1 | -1 (draw)
+      if (w !== 0 && w !== 1 && w !== -1) return;
+      resolveRankResult(room, w);
+      return;
+    }
+
+    case "rank_stats_request": {
+      const userId = String(msg.userId || "").slice(0, 64);
+      send(ws, "rank_stats", buildRankStats(userId));
       return;
     }
 
