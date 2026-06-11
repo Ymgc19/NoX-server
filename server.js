@@ -37,6 +37,24 @@ function saveRankDb() {
   try { fs.writeFileSync(RANK_FILE, JSON.stringify(rankDb, null, 2)); }
   catch (e) { console.error("rank_stats.json save error:", e); }
 }
+
+// ==================== 試合ログ (運営のデータ分析用) ====================
+// ランクマッチ1試合ごとに1行のJSONを追記する (JSONL形式)。
+// /admin/export でまとめてエクスポートできる。
+const MATCH_LOG_FILE = path.join(__dirname, "match_log.jsonl");
+function appendMatchLog(entry) {
+  try { fs.appendFileSync(MATCH_LOG_FILE, JSON.stringify(entry) + "\n"); }
+  catch (e) { console.error("match_log append error:", e); }
+}
+function readMatchLog() {
+  try {
+    if (!fs.existsSync(MATCH_LOG_FILE)) return [];
+    return fs.readFileSync(MATCH_LOG_FILE, "utf8")
+      .split("\n").filter(Boolean)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(Boolean);
+  } catch (e) { return []; }
+}
 function getRankUser(userId, name) {
   if (!userId) return null;
   if (!rankDb.users[userId]) {
@@ -121,6 +139,19 @@ function resolveRankResult(room, winnerIdx) {
     deltas = winnerIdx === 0 ? [amount, -amount] : [-amount, amount];
   }
   saveRankDb();
+  // 運営の分析用に試合ログを追記
+  appendMatchLog({
+    ts: Date.now(),
+    startedAt: room.startedAt,
+    winnerIdx, // 0 | 1 | -1 (draw)
+    users: [uidA, uidB].map((uid, i) => ({
+      userId: uid,
+      name: (rankDb.users[uid] && rankDb.users[uid].name) || "",
+      statsAtStart: room.rank.statsAtStart[i],
+      delta: deltas[i],
+      pointsAfter: (i === 0 ? uA : uB).points,
+    })),
+  });
   const payload = (idx, u) => ({
     delta: deltas[idx],
     points: u.points, wins: u.wins, losses: u.losses, winRate: winRateOf(u),
@@ -204,7 +235,61 @@ function cleanupRoom(code) {
   console.log(`[room] ${code} closed`);
 }
 
-const wss = new WebSocketServer({ port: PORT });
+// ==================== 運営者用 HTTP API ====================
+// 環境変数 ADMIN_KEY を設定すると有効化される (未設定なら全拒否 = 安全側)。
+//   エクスポート: GET /admin/export?key=ADMIN_KEY
+//     → { exportedAt, users: {userId: {name, points, wins, losses, winRate}}, matches: [...] }
+//   リセット:    GET /admin/reset?key=ADMIN_KEY&what=stats|log|all
+const http = require("http");
+const ADMIN_KEY = process.env.ADMIN_KEY || null;
+
+const httpServer = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  const sendJson = (code, obj) => {
+    res.writeHead(code, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(obj, null, 2));
+  };
+
+  if (url.pathname === "/admin/export" || url.pathname === "/admin/reset") {
+    if (!ADMIN_KEY) { sendJson(403, { error: "ADMIN_KEY が未設定のため管理APIは無効です (環境変数 ADMIN_KEY を設定してください)" }); return; }
+    if (url.searchParams.get("key") !== ADMIN_KEY) { sendJson(403, { error: "invalid key" }); return; }
+
+    if (url.pathname === "/admin/export") {
+      const users = {};
+      for (const [id, u] of Object.entries(rankDb.users)) {
+        users[id] = { name: u.name, points: u.points, wins: u.wins, losses: u.losses, winRate: winRateOf(u) };
+      }
+      sendJson(200, {
+        exportedAt: new Date().toISOString(),
+        totalUsers: Object.keys(users).length,
+        users,
+        matches: readMatchLog(),
+      });
+      console.log("[admin] export served");
+      return;
+    }
+
+    // /admin/reset
+    const what = url.searchParams.get("what") || "stats";
+    if (what === "stats" || what === "all") {
+      rankDb = { users: {} };
+      saveRankDb();
+    }
+    if (what === "log" || what === "all") {
+      try { fs.writeFileSync(MATCH_LOG_FILE, ""); } catch (e) {}
+    }
+    console.log(`[admin] reset: ${what}`);
+    sendJson(200, { ok: true, reset: what });
+    return;
+  }
+
+  // ヘルスチェック
+  res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+  res.end("NoX online server");
+});
+
+const wss = new WebSocketServer({ server: httpServer });
+httpServer.listen(PORT);
 
 wss.on("connection", (ws) => {
   ws.isAlive = true;
