@@ -464,6 +464,41 @@ function handleMessage(ws, msg) {
       return;
     }
 
+    // ===== フレンド: 指定ユーザー群の戦績 + 推移 (試合ログから再構成) =====
+    case "friends_stats_request": {
+      const ids = Array.isArray(msg.userIds) ? msg.userIds.slice(0, 50).map(x => String(x).slice(0, 64)) : [];
+      const log = readMatchLog();
+      const friends = ids.map(id => {
+        const u = rankDb.users[id];
+        if (!u) return { userId: id, found: false };
+        // 試合ログからこのユーザーの推移 [{ts, pts, wr}] を再構成 (直近30戦)
+        const trend = [];
+        for (const m of log) {
+          const me = (m.users || []).find(x => x.userId === id);
+          if (!me || !me.statsAtStart) continue;
+          const before = me.statsAtStart;
+          const games = (before.wins || 0) + (before.losses || 0);
+          const won = m.winnerIdx !== -1 && (me.delta || 0) > 0;
+          const lost = m.winnerIdx !== -1 && (me.delta || 0) < 0;
+          const winsAfter = (before.wins || 0) + (won ? 1 : 0);
+          const gamesAfter = games + (won || lost ? 1 : 0);
+          trend.push({
+            ts: m.ts,
+            pts: me.pointsAfter,
+            wr: gamesAfter > 0 ? winsAfter / gamesAfter : 0,
+          });
+        }
+        return {
+          userId: id, found: true,
+          name: u.name || "", points: u.points,
+          wins: u.wins, losses: u.losses, winRate: winRateOf(u),
+          trend: trend.slice(-30),
+        };
+      });
+      send(ws, "friends_stats", { friends });
+      return;
+    }
+
     default:
       send(ws, "error", { message: `unknown message type: ${msg.type}` });
   }
