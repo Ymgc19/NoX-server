@@ -25,7 +25,12 @@ const rooms = new Map(); // code -> { host, guest, decks:{0,1}, names:{0,1}, sta
 // users: { userId: { name, points, wins, losses } }
 // 初期勝ち点 10。勝ち +2 / 負け -2。
 // 例外: 敗者の勝率が 70% を超えていた試合は勝者 +5 / 敗者 -5。
-const RANK_FILE = path.join(__dirname, "rank_stats.json");
+// データ保存先: 環境変数 DATA_DIR を設定するとそこに保存する。
+// Render では Persistent Disk をマウントしたパス (例: /var/data) を指定すれば
+// デプロイ・再起動後もデータが消えない。未設定時は従来通りサーバディレクトリ (揮発)。
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
+const RANK_FILE = path.join(DATA_DIR, "rank_stats.json");
 const RANK_START_POINTS = 10;
 let rankDb = { users: {} };
 try {
@@ -41,7 +46,7 @@ function saveRankDb() {
 // ==================== 試合ログ (運営のデータ分析用) ====================
 // ランクマッチ1試合ごとに1行のJSONを追記する (JSONL形式)。
 // /admin/export でまとめてエクスポートできる。
-const MATCH_LOG_FILE = path.join(__dirname, "match_log.jsonl");
+const MATCH_LOG_FILE = path.join(DATA_DIR, "match_log.jsonl");
 function appendMatchLog(entry) {
   try { fs.appendFileSync(MATCH_LOG_FILE, JSON.stringify(entry) + "\n"); }
   catch (e) { console.error("match_log append error:", e); }
@@ -69,6 +74,39 @@ function winRateOf(u) {
 }
 function publicStats(u) {
   return { points: u.points, wins: u.wins, losses: u.losses, winRate: winRateOf(u) };
+}
+
+// ==================== アカウント (Twitter風: @ユーザー名 + NoX ID) ====================
+// accounts: { "NoXxxxxxxxxx": { username, createdAt, updatedAt, data } }
+//   username: "@"なしの英数字 (照合は大文字小文字を無視)
+//   data:     クライアントの userData 全体 (ログイン時の引き継ぎ用スナップショット)
+const ACCOUNTS_FILE = path.join(DATA_DIR, "accounts.json");
+let accountsDb = { accounts: {} };
+try {
+  if (fs.existsSync(ACCOUNTS_FILE)) accountsDb = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
+  if (!accountsDb.accounts) accountsDb.accounts = {};
+} catch (e) { console.error("accounts.json load error:", e); accountsDb = { accounts: {} }; }
+function saveAccounts() {
+  try { fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accountsDb)); }
+  catch (e) { console.error("accounts.json save error:", e); }
+}
+// NoX + 9桁のユニーク英数字 (紛らわしい 0/O/1/I/L を除外)
+function genNoxId() {
+  const cs = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let id;
+  do {
+    id = "NoX" + Array.from({ length: 9 }, () => cs[Math.floor(Math.random() * cs.length)]).join("");
+  } while (accountsDb.accounts[id]);
+  return id;
+}
+function normUsername(u) {
+  return String(u || "").trim().replace(/^@+/, "");
+}
+function accountAuth(noxId, username) {
+  const acc = accountsDb.accounts[String(noxId || "")];
+  if (!acc) return null;
+  if (acc.username.toLowerCase() !== normUsername(username).toLowerCase()) return null;
+  return acc;
 }
 
 // マッチングキュー: { ws, userId, name, deck }
@@ -250,9 +288,51 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify(obj, null, 2));
   };
 
-  if (url.pathname === "/admin/export" || url.pathname === "/admin/reset") {
+  if (url.pathname === "/admin/export" || url.pathname === "/admin/reset" || url.pathname === "/admin/import") {
     if (!ADMIN_KEY) { sendJson(403, { error: "ADMIN_KEY が未設定のため管理APIは無効です (環境変数 ADMIN_KEY を設定してください)" }); return; }
     if (url.searchParams.get("key") !== ADMIN_KEY) { sendJson(403, { error: "invalid key" }); return; }
+
+    // バックアップ (export したJSON) からの復元: デプロイでデータが消えた後に使う
+    //   curl -X POST ".../admin/import?key=KEY" -H "Content-Type: application/json" --data-binary @nox_export.json
+    if (url.pathname === "/admin/import") {
+      if (req.method !== "POST") { sendJson(405, { error: "POST でJSONを送信してください" }); return; }
+      let body = "";
+      let size = 0;
+      req.on("data", chunk => {
+        size += chunk.length;
+        if (size > 20 * 1024 * 1024) { req.destroy(); return; } // 20MB上限
+        body += chunk;
+      });
+      req.on("end", () => {
+        try {
+          const data = JSON.parse(body);
+          let userCount = 0, matchCount = 0;
+          if (data.users && typeof data.users === "object") {
+            const users = {};
+            for (const [id, u] of Object.entries(data.users)) {
+              users[id] = {
+                name: String(u.name || ""),
+                points: Number.isFinite(u.points) ? u.points : RANK_START_POINTS,
+                wins: Number.isFinite(u.wins) ? u.wins : 0,
+                losses: Number.isFinite(u.losses) ? u.losses : 0,
+              };
+              userCount++;
+            }
+            rankDb = { users };
+            saveRankDb();
+          }
+          if (Array.isArray(data.matches)) {
+            fs.writeFileSync(MATCH_LOG_FILE, data.matches.map(m => JSON.stringify(m)).join("\n") + (data.matches.length ? "\n" : ""));
+            matchCount = data.matches.length;
+          }
+          console.log(`[admin] import: users=${userCount} matches=${matchCount}`);
+          sendJson(200, { ok: true, importedUsers: userCount, importedMatches: matchCount });
+        } catch (e) {
+          sendJson(400, { error: "JSONの解析に失敗: " + (e.message || e) });
+        }
+      });
+      return;
+    }
 
     if (url.pathname === "/admin/export") {
       const users = {};
@@ -461,6 +541,53 @@ function handleMessage(ws, msg) {
     case "rank_stats_request": {
       const userId = String(msg.userId || "").slice(0, 64);
       send(ws, "rank_stats", buildRankStats(userId));
+      return;
+    }
+
+    // ===== アカウント登録: @ユーザー名 → NoX ID を発行 =====
+    case "account_register": {
+      const username = normUsername(msg.username);
+      if (!/^[A-Za-z0-9]{1,15}$/.test(username)) {
+        send(ws, "account_error", { op: "register", message: "ユーザー名は英数字1〜15文字で入力してください" });
+        return;
+      }
+      const noxId = genNoxId();
+      accountsDb.accounts[noxId] = { username, createdAt: Date.now(), updatedAt: null, data: null };
+      saveAccounts();
+      send(ws, "account_registered", { noxId, username });
+      console.log(`[account] register: @${username} → ${noxId}`);
+      return;
+    }
+
+    // ===== ログイン: ユーザー名 + NoX ID の組で照合し、保存済みデータを返す =====
+    case "account_login": {
+      const acc = accountAuth(msg.noxId, msg.username);
+      if (!acc) {
+        send(ws, "account_error", { op: "login", message: "ユーザー名とIDの組み合わせが見つかりません" });
+        return;
+      }
+      send(ws, "account_login_ok", {
+        noxId: String(msg.noxId),
+        username: acc.username,
+        data: acc.data || null,
+        updatedAt: acc.updatedAt,
+      });
+      console.log(`[account] login: @${acc.username} (${msg.noxId})`);
+      return;
+    }
+
+    // ===== データ同期: クライアントの userData をアカウントに保存 (引き継ぎ用) =====
+    case "account_sync": {
+      const acc = accountAuth(msg.noxId, msg.username);
+      if (!acc) return; // 認証不一致は黙殺
+      try {
+        const raw = JSON.stringify(msg.data || null);
+        if (raw.length > 500_000) { send(ws, "account_error", { op: "sync", message: "データが大きすぎます" }); return; }
+        acc.data = msg.data || null;
+        acc.updatedAt = Date.now();
+        saveAccounts();
+        send(ws, "account_synced", { updatedAt: acc.updatedAt });
+      } catch (e) { /* ignore */ }
       return;
     }
 
