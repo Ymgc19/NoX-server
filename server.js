@@ -4,7 +4,7 @@
 //  ・ルーム作成/参加 (6文字コード)
 //  ・ピア間メッセージ中継 (action, snapshot, deck提出)
 //  ・サーバー権威の入口を意識: future-work として action 検証ロジック
-//    を server 側に持たせる前提で API を整理。今は relay。
+//    を server 側に持たせる前提で API を整理．今は relay．
 //  -------------------------------------------------------
 //  Run:
 //      cd server && npm install && npm start
@@ -23,11 +23,11 @@ const rooms = new Map(); // code -> { host, guest, decks:{0,1}, names:{0,1}, sta
 
 // ==================== ランクマッチ: 勝ち点・戦績の永続化 ====================
 // users: { userId: { name, points, wins, losses } }
-// 初期勝ち点 10。勝ち +2 / 負け -2。
-// 例外: 敗者の勝率が 70% を超えていた試合は勝者 +5 / 敗者 -5。
-// データ保存先: 環境変数 DATA_DIR を設定するとそこに保存する。
+// 初期勝ち点 10．勝ち +2 / 負け -2．
+// 例外: 敗者の勝率が 70% を超えていた試合は勝者 +5 / 敗者 -5．
+// データ保存先: 環境変数 DATA_DIR を設定するとそこに保存する．
 // Render では Persistent Disk をマウントしたパス (例: /var/data) を指定すれば
-// デプロイ・再起動後もデータが消えない。未設定時は従来通りサーバディレクトリ (揮発)。
+// デプロイ・再起動後もデータが消えない．未設定時は従来通りサーバディレクトリ (揮発)．
 const DATA_DIR = process.env.DATA_DIR || __dirname;
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 const RANK_FILE = path.join(DATA_DIR, "rank_stats.json");
@@ -44,8 +44,8 @@ function saveRankDb() {
 }
 
 // ==================== 試合ログ (運営のデータ分析用) ====================
-// ランクマッチ1試合ごとに1行のJSONを追記する (JSONL形式)。
-// /admin/export でまとめてエクスポートできる。
+// ランクマッチ1試合ごとに1行のJSONを追記する (JSONL形式)．
+// /admin/export でまとめてエクスポートできる．
 const MATCH_LOG_FILE = path.join(DATA_DIR, "match_log.jsonl");
 function appendMatchLog(entry) {
   try { fs.appendFileSync(MATCH_LOG_FILE, JSON.stringify(entry) + "\n"); }
@@ -167,7 +167,7 @@ function resolveRankResult(room, winnerIdx) {
   if (winnerIdx === 0 || winnerIdx === 1) {
     const winner = winnerIdx === 0 ? uA : uB;
     const loser  = winnerIdx === 0 ? uB : uA;
-    // 勝率は試合開始時点の値で判定 (敗者の勝率が70%超なら ±5、それ以外 ±2)
+    // 勝率は試合開始時点の値で判定 (敗者の勝率が70%超なら ±5，それ以外 ±2)
     const loserWrAtStart = room.rank.statsAtStart[winnerIdx === 0 ? 1 : 0].winRate;
     const amount = loserWrAtStart > 0.7 ? 5 : 2;
     winner.wins += 1;
@@ -274,7 +274,7 @@ function cleanupRoom(code) {
 }
 
 // ==================== 運営者用 HTTP API ====================
-// 環境変数 ADMIN_KEY を設定すると有効化される (未設定なら全拒否 = 安全側)。
+// 環境変数 ADMIN_KEY を設定すると有効化される (未設定なら全拒否 = 安全側)．
 //   エクスポート: GET /admin/export?key=ADMIN_KEY
 //     → { exportedAt, users: {userId: {name, points, wins, losses, winRate}}, matches: [...] }
 //   リセット:    GET /admin/reset?key=ADMIN_KEY&what=stats|log|all
@@ -392,8 +392,8 @@ wss.on("connection", (ws) => {
     if (ws.roomCode) {
       const room = rooms.get(ws.roomCode);
       if (room) {
-        // 対戦中の切断 (アプリを閉じた等) は切断側の強制敗北。
-        // ランクマッチなら勝ち点も確定させてから残ったピアに通知する。
+        // 対戦中の切断 (アプリを閉じた等) は切断側の強制敗北．
+        // ランクマッチなら勝ち点も確定させてから残ったピアに通知する．
         if (room.rank && room.startedAt && !room.rank.resultDone) {
           const winnerIdx = (room.host === ws) ? 1 : 0; // 切断していない側が勝者
           console.log(`[rank] disconnect forfeit: P${winnerIdx === 0 ? 2 : 1} left → P${winnerIdx + 1} wins`);
@@ -401,7 +401,7 @@ wss.on("connection", (ws) => {
         }
         if (room.host === ws) room.host = null;
         if (room.guest === ws) room.guest = null;
-        // PoC: ピアが落ちたらルーム破棄 (残ったピアには peer_left が届き、クライアント側で勝利処理)
+        // PoC: ピアが落ちたらルーム破棄 (残ったピアには peer_left が届き，クライアント側で勝利処理)
         cleanupRoom(ws.roomCode);
       }
     }
@@ -487,7 +487,7 @@ function handleMessage(ws, msg) {
     case "action":
     case "snapshot":
     case "combat": {
-      // ピアへ中継 (PoC: サーバーは検証せず素通し。将来はここでルール検証)
+      // ピアへ中継 (PoC: サーバーは検証せず素通し．将来はここでルール検証)
       if (!ws.roomCode) return;
       const room = rooms.get(ws.roomCode);
       if (!room) return;
@@ -555,7 +555,7 @@ function handleMessage(ws, msg) {
       const taken = Object.values(accountsDb.accounts)
         .some(a => a.username.toLowerCase() === username.toLowerCase());
       if (taken) {
-        send(ws, "account_error", { op: "register", code: "name_taken", message: `@${username} は既に使用されています。別のユーザー名を入力してください` });
+        send(ws, "account_error", { op: "register", code: "name_taken", message: `@${username} は既に使用されています．別のユーザー名を入力してください` });
         return;
       }
       const noxId = genNoxId();
@@ -566,7 +566,7 @@ function handleMessage(ws, msg) {
       return;
     }
 
-    // ===== ログイン: ユーザー名 + NoX ID の組で照合し、保存済みデータを返す =====
+    // ===== ログイン: ユーザー名 + NoX ID の組で照合し，保存済みデータを返す =====
     case "account_login": {
       const acc = accountAuth(msg.noxId, msg.username);
       if (!acc) {
