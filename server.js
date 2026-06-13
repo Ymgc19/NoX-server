@@ -551,6 +551,13 @@ function handleMessage(ws, msg) {
         send(ws, "account_error", { op: "register", message: "ユーザー名は英数字1〜15文字で入力してください" });
         return;
       }
+      // ユーザー名はユーザー間でユニーク (大文字小文字を区別しない)
+      const taken = Object.values(accountsDb.accounts)
+        .some(a => a.username.toLowerCase() === username.toLowerCase());
+      if (taken) {
+        send(ws, "account_error", { op: "register", code: "name_taken", message: `@${username} は既に使用されています。別のユーザー名を入力してください` });
+        return;
+      }
       const noxId = genNoxId();
       accountsDb.accounts[noxId] = { username, createdAt: Date.now(), updatedAt: null, data: null };
       saveAccounts();
