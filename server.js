@@ -181,10 +181,12 @@ function resolveRankResult(room, winnerIdx) {
   appendMatchLog({
     ts: Date.now(),
     startedAt: room.startedAt,
+    mode: "rank",
     winnerIdx, // 0 | 1 | -1 (draw)
     users: [uidA, uidB].map((uid, i) => ({
       userId: uid,
       name: (rankDb.users[uid] && rankDb.users[uid].name) || "",
+      deck: room.decks[i] || null, // 使用デッキ (カードID配列)
       statsAtStart: room.rank.statsAtStart[i],
       delta: deltas[i],
       pointsAfter: (i === 0 ? uA : uB).points,
@@ -491,6 +493,30 @@ function handleMessage(ws, msg) {
       if (!ws.roomCode) return;
       const room = rooms.get(ws.roomCode);
       if (!room) return;
+      // 通常マッチ (ルーム/フレンド戦) の対戦ログ: 終了通知を検知して記録．
+      // ランク戦は resolveRankResult 側で (勝ち点付きで) 記録するためここでは除外．
+      if (msg.type === "combat" && !room.rank && !room.matchLogged && room.startedAt) {
+        let winnerIdx = null;
+        if (msg.kind === "game_end" && (msg.winner === 0 || msg.winner === 1 || msg.winner === -1)) {
+          winnerIdx = msg.winner;
+        } else if (msg.kind === "surrender") {
+          winnerIdx = ws.role === "host" ? 1 : 0; // 投了の送信者の相手が勝者
+        }
+        if (winnerIdx !== null) {
+          room.matchLogged = true;
+          appendMatchLog({
+            ts: Date.now(),
+            startedAt: room.startedAt,
+            mode: "casual",
+            winnerIdx, // 0 | 1 | -1 (draw)
+            reason: String(msg.reason || (msg.kind === "surrender" ? "投了" : "")).slice(0, 120),
+            users: [0, 1].map(i => ({
+              name: room.names[i] || "",
+              deck: room.decks[i] || null, // 使用デッキ (カードID配列)
+            })),
+          });
+        }
+      }
       broadcastToRoom(room, msg.type, { ...msg, from: ws.role }, ws);
       return;
     }
