@@ -23,8 +23,11 @@ const rooms = new Map(); // code -> { host, guest, decks:{0,1}, names:{0,1}, sta
 
 // ==================== ランクマッチ: 勝ち点・戦績の永続化 ====================
 // users: { userId: { name, points, wins, losses } }
-// 初期勝ち点 10．勝ち +2 / 負け -2．
-// 例外: 敗者の勝率が 70% を超えていた試合は勝者 +5 / 敗者 -5．
+// 初期勝ち点 10．
+// 勝ち点はポット方式: 対戦開始時点の各自の勝ち点の RANK_ALPHA 倍 (四捨五入) を
+// 両者が供出し，合計を勝者が総取りする．実質の増減は
+//   勝者: +(敗者の供出分) / 敗者: -(敗者の供出分)
+// となりゼロサム．引き分け・不成立時は供出分がそのまま返る (増減なし)．
 // データ保存先: 環境変数 DATA_DIR を設定するとそこに保存する．
 // Render では Persistent Disk をマウントしたパス (例: /var/data) を指定すれば
 // デプロイ・再起動後もデータが消えない．未設定時は従来通りサーバディレクトリ (揮発)．
@@ -32,6 +35,11 @@ const DATA_DIR = process.env.DATA_DIR || __dirname;
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
 const RANK_FILE = path.join(DATA_DIR, "rank_stats.json");
 const RANK_START_POINTS = 10;
+const RANK_ALPHA = 0.5; // 各プレイヤーが賭ける勝ち点の割合 (0-1)
+// 対戦開始時点の勝ち点から供出額を計算する
+function stakeOf(points) {
+  return Math.round(RANK_ALPHA * Math.max(0, points));
+}
 let rankDb = { users: {} };
 try {
   if (fs.existsSync(RANK_FILE)) rankDb = JSON.parse(fs.readFileSync(RANK_FILE, "utf8"));
@@ -136,6 +144,7 @@ function tryRankMatch() {
       rank: {
         userIds: [a.userId, b.userId],
         statsAtStart: [publicStats(uA), publicStats(uB)],
+        stakes: [stakeOf(uA.points), stakeOf(uB.points)], // 開始時点の供出額 (ポット方式)
         resultDone: false,
       },
     };
@@ -167,14 +176,14 @@ function resolveRankResult(room, winnerIdx) {
   if (winnerIdx === 0 || winnerIdx === 1) {
     const winner = winnerIdx === 0 ? uA : uB;
     const loser  = winnerIdx === 0 ? uB : uA;
-    // 勝率は試合開始時点の値で判定 (敗者の勝率が70%超なら ±5，それ以外 ±2)
-    const loserWrAtStart = room.rank.statsAtStart[winnerIdx === 0 ? 1 : 0].winRate;
-    const amount = loserWrAtStart > 0.7 ? 5 : 2;
+    // ポット方式: 開始時に両者が勝ち点の RANK_ALPHA 倍を供出し，勝者が総取り．
+    // 勝者は自分の供出分が返ってくるため，実質増減は敗者の供出分のみ．
+    const loserStake = room.rank.stakes[winnerIdx === 0 ? 1 : 0];
     winner.wins += 1;
     loser.losses += 1;
-    winner.points = winner.points + amount;
-    loser.points = Math.max(0, loser.points - amount);
-    deltas = winnerIdx === 0 ? [amount, -amount] : [-amount, amount];
+    winner.points = winner.points + loserStake;
+    loser.points = Math.max(0, loser.points - loserStake);
+    deltas = winnerIdx === 0 ? [loserStake, -loserStake] : [-loserStake, loserStake];
   }
   saveRankDb();
   // 運営の分析用に試合ログを追記
