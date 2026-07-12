@@ -213,14 +213,15 @@ function resolveRankResult(room, winnerIdx) {
 }
 
 // ==================== 日刊 逢魔時の禍々マガジン (ログインボーナス誌面) ====================
-// クライアントが指定した期間の試合ログから
 //   star:    注目度アップ中のプレイヤー = 期間内の勝ち点純増が最大の人 (タイブレークは勝利数)
-//   popular: 最も多く使われているカード Top5 (デッキ投入枚数ベース)
-// を集計して返す．ログが無い期間は null / 空配列．
+//            (クライアント指定の期間で試合ログから集計)
+//   popular: 人気カードランキング = 全プレイヤーのデッキで最も広く採用されているカード Top5
+//            (アカウント同期データの全デッキ編成を横断し，採用プレイヤー数ベース．
+//             タイブレークは総採用枚数．n = 採用プレイヤー数として返す)
+// データが無い場合は null / 空配列．
 function buildMagazineData(msg) {
   const num = (v, d) => (Number.isFinite(v) ? v : d);
-  const starFrom  = num(msg.starFrom, 0),  starTo  = num(msg.starTo, Date.now());
-  const cardsFrom = num(msg.cardsFrom, 0), cardsTo = num(msg.cardsTo, Date.now());
+  const starFrom = num(msg.starFrom, 0), starTo = num(msg.starTo, Date.now());
   const log = readMatchLog().filter(e => e && e.mode === "rank" && Array.isArray(e.users));
   // 注目株: 勝敗に関わらず全参加者の勝ち点増減を合算し，純増が最大の人を選ぶ
   const byUser = {};
@@ -239,20 +240,30 @@ function buildMagazineData(msg) {
   const star = Object.values(byUser)
     .filter(u => u.name && u.gained > 0)
     .sort((a, b) => b.gained - a.gained || b.wins - a.wins)[0] || null;
-  // 人気カード番付
-  const byCard = {};
-  for (const e of log) {
-    if (!(e.ts >= cardsFrom && e.ts < cardsTo)) continue;
-    for (const u of e.users) {
-      if (!u || !Array.isArray(u.deck)) continue;
-      for (const id of u.deck) {
-        if (typeof id === "string") byCard[id] = (byCard[id] || 0) + 1;
+  // 人気カードランキング: 全プレイヤーのデッキ編成を横断して採用状況を集計
+  const byCard = {}; // cardId -> { users: 採用プレイヤー数, copies: 総採用枚数 }
+  for (const acc of Object.values(accountsDb.accounts)) {
+    const d = acc && acc.data;
+    if (!d) continue;
+    // このプレイヤーの全デッキ (現行デッキ + 保存スロット) の採用枚数を数える
+    const copies = {};
+    const addDeck = (arr) => {
+      if (!Array.isArray(arr)) return;
+      for (const id of arr) {
+        if (typeof id === "string") copies[id] = (copies[id] || 0) + 1;
       }
+    };
+    addDeck(d.currentDeck);
+    if (Array.isArray(d.decks)) for (const slot of d.decks) addDeck(slot && slot.cards);
+    for (const [id, n] of Object.entries(copies)) {
+      if (!byCard[id]) byCard[id] = { users: 0, copies: 0 };
+      byCard[id].users += 1;
+      byCard[id].copies += n;
     }
   }
   const popular = Object.entries(byCard)
-    .map(([id, n]) => ({ id, n }))
-    .sort((a, b) => b.n - a.n)
+    .map(([id, v]) => ({ id, n: v.users, copies: v.copies }))
+    .sort((a, b) => b.n - a.n || b.copies - a.copies)
     .slice(0, 5);
   return { star: star ? { name: star.name, wins: star.wins, gained: star.gained } : null, popular };
 }
