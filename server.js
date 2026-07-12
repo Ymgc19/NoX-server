@@ -212,6 +212,51 @@ function resolveRankResult(room, winnerIdx) {
   console.log(`[rank] result winner=P${winnerIdx + 1} deltas=${deltas.join("/")}`);
 }
 
+// ==================== 日刊 逢魔時の禍々マガジン (ログインボーナス誌面) ====================
+// クライアントが指定した期間の試合ログから
+//   star:    注目度アップ中のプレイヤー = 期間内の勝ち点純増が最大の人 (タイブレークは勝利数)
+//   popular: 最も多く使われているカード Top5 (デッキ投入枚数ベース)
+// を集計して返す．ログが無い期間は null / 空配列．
+function buildMagazineData(msg) {
+  const num = (v, d) => (Number.isFinite(v) ? v : d);
+  const starFrom  = num(msg.starFrom, 0),  starTo  = num(msg.starTo, Date.now());
+  const cardsFrom = num(msg.cardsFrom, 0), cardsTo = num(msg.cardsTo, Date.now());
+  const log = readMatchLog().filter(e => e && e.mode === "rank" && Array.isArray(e.users));
+  // 注目株: 勝敗に関わらず全参加者の勝ち点増減を合算し，純増が最大の人を選ぶ
+  const byUser = {};
+  for (const e of log) {
+    if (!(e.ts >= starFrom && e.ts < starTo)) continue;
+    for (let i = 0; i < e.users.length; i++) {
+      const u = e.users[i];
+      if (!u) continue;
+      const k = u.userId || u.name || "?";
+      if (!byUser[k]) byUser[k] = { name: "", wins: 0, gained: 0 };
+      byUser[k].gained += num(u.delta, 0);
+      if (e.winnerIdx === i) byUser[k].wins += 1;
+      if (u.name) byUser[k].name = u.name;
+    }
+  }
+  const star = Object.values(byUser)
+    .filter(u => u.name && u.gained > 0)
+    .sort((a, b) => b.gained - a.gained || b.wins - a.wins)[0] || null;
+  // 人気カード番付
+  const byCard = {};
+  for (const e of log) {
+    if (!(e.ts >= cardsFrom && e.ts < cardsTo)) continue;
+    for (const u of e.users) {
+      if (!u || !Array.isArray(u.deck)) continue;
+      for (const id of u.deck) {
+        if (typeof id === "string") byCard[id] = (byCard[id] || 0) + 1;
+      }
+    }
+  }
+  const popular = Object.entries(byCard)
+    .map(([id, n]) => ({ id, n }))
+    .sort((a, b) => b.n - a.n)
+    .slice(0, 5);
+  return { star: star ? { name: star.name, wins: star.wins, gained: star.gained } : null, popular };
+}
+
 // 全ユーザー分布 (ホームの STATS ブロック用) — 勝ち点ベースのヒストグラム
 function buildRankStats(userId) {
   const all = Object.values(rankDb.users)
@@ -576,6 +621,12 @@ function handleMessage(ws, msg) {
     case "rank_stats_request": {
       const userId = String(msg.userId || "").slice(0, 64);
       send(ws, "rank_stats", buildRankStats(userId));
+      return;
+    }
+
+    // ===== ログインボーナス誌面 (前日の勝ち頭 + 人気カード番付) =====
+    case "magazine_request": {
+      send(ws, "magazine_data", buildMagazineData(msg));
       return;
     }
 
