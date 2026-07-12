@@ -24,11 +24,12 @@ const rooms = new Map(); // code -> { host, guest, decks:{0,1}, names:{0,1}, sta
 // ==================== ランクマッチ: 勝ち点・戦績の永続化 ====================
 // users: { userId: { name, points, wins, losses } }
 // 初期勝ち点 10．
-// 勝ち点は「合算移動方式」: 対戦開始時点の両プレイヤーの勝ち点それぞれの
-// RANK_ALPHA 倍を足し合わせた S = α×P1 + α×P2 が，敗者から勝者へ移動する．
-//   勝者: +S / 敗者: -S (0未満にはならず0止め．勝者には満額入る)
+// 勝ち点はポット方式: 対戦開始時点の各自の勝ち点×RANK_ALPHA を両者が供出して
+// 合算し (ポット)，勝者が総取りする．勝者は自分の供出分が戻るため実質増減は
+//   勝者: +(敗者の供出分) / 敗者: -(敗者の供出分)
+// となりゼロサム．例: 10pt vs 10pt → 5+5=10 のポットを勝者が取り，勝者15pt/敗者5pt．
 // 勝ち点は小数を許容する (丸めは表示側で行い，小数第3位以下を丸める)．
-// 引き分け・不成立時は増減なし．
+// 引き分け・不成立時は供出分がそのまま返る (増減なし)．
 // データ保存先: 環境変数 DATA_DIR を設定するとそこに保存する．
 // Render では Persistent Disk をマウントしたパス (例: /var/data) を指定すれば
 // デプロイ・再起動後もデータが消えない．未設定時は従来通りサーバディレクトリ (揮発)．
@@ -177,14 +178,14 @@ function resolveRankResult(room, winnerIdx) {
   if (winnerIdx === 0 || winnerIdx === 1) {
     const winner = winnerIdx === 0 ? uA : uB;
     const loser  = winnerIdx === 0 ? uB : uA;
-    // 合算移動方式: 開始時点の両者の勝ち点×RANK_ALPHA の合算値 S が敗者から勝者へ移動する．
-    // 勝者は +S 満額，敗者は -S (ただし0未満にはならない)．小数のまま計算する．
-    const moveAmount = room.rank.stakes[0] + room.rank.stakes[1];
+    // ポット方式: 開始時に両者が勝ち点×RANK_ALPHA を供出し (合算=ポット)，勝者が総取り．
+    // 勝者は自分の供出分が返ってくるため，実質増減は敗者の供出分のみ (小数のまま計算)．
+    const loserStake = room.rank.stakes[winnerIdx === 0 ? 1 : 0];
     winner.wins += 1;
     loser.losses += 1;
-    winner.points = winner.points + moveAmount;
-    loser.points = Math.max(0, loser.points - moveAmount);
-    deltas = winnerIdx === 0 ? [moveAmount, -moveAmount] : [-moveAmount, moveAmount];
+    winner.points = winner.points + loserStake;
+    loser.points = Math.max(0, loser.points - loserStake);
+    deltas = winnerIdx === 0 ? [loserStake, -loserStake] : [-loserStake, loserStake];
   }
   saveRankDb();
   // 運営の分析用に試合ログを追記
