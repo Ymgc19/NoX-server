@@ -408,12 +408,23 @@ const httpServer = http.createServer((req, res) => {
       for (const [id, u] of Object.entries(rankDb.users)) {
         users[id] = { name: u.name, points: u.points, wins: u.wins, losses: u.losses, winRate: winRateOf(u) };
       }
-      sendJson(200, {
+      const payload = {
         exportedAt: new Date().toISOString(),
         totalUsers: Object.keys(users).length,
         users,
         matches: readMatchLog(),
-      });
+      };
+      // &download=1 を付けるとブラウザがJSONファイルとして保存する (コピペ不要)
+      if (url.searchParams.get("download")) {
+        const fname = `nox_export_${new Date().toISOString().slice(0, 10)}.json`;
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${fname}"`,
+        });
+        res.end(JSON.stringify(payload, null, 2));
+      } else {
+        sendJson(200, payload);
+      }
       console.log("[admin] export served");
       return;
     }
@@ -555,6 +566,7 @@ function handleMessage(ws, msg) {
 
     case "action":
     case "snapshot":
+    case "resync_request": // 同期切れ検知時の再送要求 (クライアント側で最新状態を持つ方が再送する)
     case "combat": {
       // ピアへ中継 (PoC: サーバーは検証せず素通し．将来はここでルール検証)
       if (!ws.roomCode) return;
