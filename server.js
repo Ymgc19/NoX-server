@@ -704,6 +704,30 @@ function handleMessage(ws, msg) {
         acc.data = msg.data || null;
         acc.updatedAt = Date.now();
         saveAccounts();
+        // ==== 勝ち点の自動復元 ====
+        // サーバリセット (再デプロイ等) で rank_stats.json が消えても，各クライアントは
+        // 自分の勝ち点・戦績のミラーを userData.rank に保持している．サーバ側に記録が
+        // 無いユーザーが同期してきたら，そのミラーから再登録する．これによりプレイヤーが
+        // ログインするたびに分布が自然に復元されていく．
+        // (既にサーバ記録があるユーザーには適用しない = サーバが常に正)
+        try {
+          const d = msg.data;
+          const uid = d && (d.userId || d.noxId);
+          if (uid && d && d.rank && !rankDb.users[uid]) {
+            const clamp = (v, min, max, dflt) => (Number.isFinite(v) ? Math.max(min, Math.min(max, v)) : dflt);
+            const wins = Math.round(clamp(d.rank.wins, 0, 1000000, 0));
+            const losses = Math.round(clamp(d.rank.losses, 0, 1000000, 0));
+            if (wins + losses > 0 || Number.isFinite(d.rank.points)) {
+              rankDb.users[uid] = {
+                name: String(d.displayName || d.username || "").replace(/^@+/, "").slice(0, 30),
+                points: clamp(d.rank.points, 0, 1000000, RANK_START_POINTS),
+                wins, losses,
+              };
+              saveRankDb();
+              console.log(`[rank] クライアント同期から勝ち点を復元: ${uid} (${rankDb.users[uid].points}pt / ${wins}勝${losses}敗)`);
+            }
+          }
+        } catch (e) { /* 復元失敗は無視 (通常の同期は成立済み) */ }
         send(ws, "account_synced", { updatedAt: acc.updatedAt });
       } catch (e) { /* ignore */ }
       return;
