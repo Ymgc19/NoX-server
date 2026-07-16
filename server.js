@@ -288,6 +288,7 @@ function buildRankStats(userId) {
   }
   return {
     histType: "points",
+    resetEpoch: rankDb.resetEpoch || 0, // 運営リセットの世代 (クライアントはこれを見て手元の戦績を初期化する)
     histogram: bins,
     binSize,
     totalUsers: all.length,
@@ -432,7 +433,10 @@ const httpServer = http.createServer((req, res) => {
     // /admin/reset
     const what = url.searchParams.get("what") || "stats";
     if (what === "stats" || what === "all") {
-      rankDb = { users: {} };
+      // resetEpoch を進めると，各クライアントは次回接続時に手元の勝ち点・戦績・
+      // 折れ線グラフ (rank.history) を初期化する．クライアントミラーからの
+      // 自動復元もこの世代より古いデータは拒否される．
+      rankDb = { users: {}, resetEpoch: Date.now() };
       saveRankDb();
     }
     if (what === "log" || what === "all") {
@@ -713,7 +717,9 @@ function handleMessage(ws, msg) {
         try {
           const d = msg.data;
           const uid = d && (d.userId || d.noxId);
-          if (uid && d && d.rank && !rankDb.users[uid]) {
+          // 運営リセットより古い世代のミラーからは復元しない (リセットの巻き戻し防止)
+          const epochOk = (Number(d && d.rankResetEpoch) || 0) >= (rankDb.resetEpoch || 0);
+          if (uid && d && d.rank && !rankDb.users[uid] && epochOk) {
             const clamp = (v, min, max, dflt) => (Number.isFinite(v) ? Math.max(min, Math.min(max, v)) : dflt);
             const wins = Math.round(clamp(d.rank.wins, 0, 1000000, 0));
             const losses = Math.round(clamp(d.rank.losses, 0, 1000000, 0));
